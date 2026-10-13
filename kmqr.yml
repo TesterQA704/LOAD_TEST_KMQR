@@ -1,0 +1,101 @@
+# Load test KMQR dengan Artillery + Playwright
+#
+# Jalankan selalu dengan environment (-e), contoh:
+#   npx artillery run kmqr.yml -e smoke
+#   npx artillery run kmqr.yml -e load -o results
+#
+# Model beban Artillery = "arrival": setiap virtual user (VU) datang, menjalankan 1 sesi, lalu selesai.
+# Jumlah user bersamaan ≈ laju kedatangan × durasi satu sesi.
+# Contoh: 1 sesi ≈ 50 detik, arrivalCount 30 dalam 300 detik (1 user / 10 detik) → ±5 user bersamaan.
+
+config:
+  target: https://stg-kmqr.kalbe.co.id
+  processor: ./flows.js
+
+  engines:
+    playwright:
+      aggregateByName: true
+      defaultTimeout: 30 # detik, batas tunggu elemen
+      defaultNavigationTimeout: 60 # detik, batas tunggu page.goto
+      launchOptions:
+        headless: true
+
+  # Akun test, dibagi bergiliran ke tiap VU
+  payload:
+    path: ./data/users.csv
+    fields:
+      - username
+      - password
+    order: sequence
+    skipHeader: true
+
+  # Plugin ensure harus diaktifkan di sini, kalau tidak bagian "ensure" di bawah diabaikan
+  plugins:
+    ensure: {}
+
+  # Kriteria lulus test (exit code 1 kalau tidak terpenuhi)
+  ensure:
+    maxErrorRate: 10 # maksimal 10% sesi user gagal
+    thresholds:
+      - "kmqr.login.p95": 5000
+      - "kmqr.module_load.p95": 3000
+      - "kmqr.metrics_refresh.p95": 3000
+
+  # PENTING: phases hanya didefinisikan di sini (per environment), jangan di level config,
+  # karena Artillery menggabungkan array per indeks dan phase bisa tercampur.
+  environments:
+    # 1 user, 1 sesi: cek locator benar
+    smoke:
+      phases:
+        - name: smoke
+          duration: 1
+          arrivalCount: 1
+
+    # Sama seperti smoke, tapi browser terlihat (untuk debugging locator)
+    debug:
+      phases:
+        - name: debug
+          duration: 1
+          arrivalCount: 1
+      engines:
+        playwright:
+          launchOptions:
+            headless: false
+
+    # Beban normal: ±5 user bersamaan
+    load:
+      phases:
+        - name: ramp-up # ±2-3 user bersamaan
+          duration: 120
+          arrivalCount: 6
+          maxVusers: 10
+        - name: sustained # ±5 user bersamaan
+          duration: 300
+          arrivalCount: 30
+          maxVusers: 10
+
+    # Opsional: naik bertahap untuk mencari titik batas (±5 → ±10 → ±20 user)
+    stress:
+      phases:
+        - name: level-5
+          duration: 180
+          arrivalCount: 18
+          maxVusers: 5
+        - name: level-10
+          duration: 180
+          arrivalCount: 36
+          maxVusers: 10
+        - name: level-20
+          duration: 180
+          arrivalCount: 72
+          maxVusers: 20
+      ensure:
+        thresholds:
+          - "kmqr.login.p95": 10000
+          - "kmqr.module_load.p95": 8000
+          - "kmqr.metrics_refresh.p95": 8000
+
+scenarios:
+  - name: kmqr-user-journey
+    engine: playwright
+    testFunction: kmqrJourney

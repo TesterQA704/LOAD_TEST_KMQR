@@ -1,0 +1,18 @@
+{
+  "name": "kmqr-load-test-artillery",
+  "version": "1.0.0",
+  "description": "Load test KMQR dengan Artillery + Playwright",
+  "private": true,
+  "scripts": {
+    "smoke": "node run.js smoke",
+    "debug": "node run.js debug",
+    "load": "node run.js load",
+    "stress": "node run.js stress",
+    "report": "node report.js",
+    "raw": "artillery run kmqr.yml"
+  },
+  "type": "commonjs",
+  "devDependencies": {
+    "artillery": "^2.0.34"
+  }
+}

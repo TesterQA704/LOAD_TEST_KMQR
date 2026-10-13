@@ -1,0 +1,9 @@
+node_modules/
+
+# Akun test asli
+data/users.csv
+.env
+
+# Hasil test
+results/*
+!results/.gitkeep
