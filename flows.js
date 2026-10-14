@@ -28,6 +28,22 @@ function live(type, data) {
   if (LIVE) process.stdout.write(`@@KMQR ${JSON.stringify({ t: type, ...data })}\n`);
 }
 
+// Lag event loop proses yang menjalankan Playwright: seberapa terlambat timer 500 ms berjalan.
+// Kalau > 1 detik, laptop kewalahan menjalankan browser, jadi kelambatan/timeout bisa berasal dari laptop.
+if (LIVE) {
+  let expected = Date.now() + 500;
+  let maxLag = 0;
+  setInterval(() => {
+    const now = Date.now();
+    maxLag = Math.max(maxLag, now - expected);
+    expected = now + 500;
+  }, 500).unref();
+  setInterval(() => {
+    live('lag', { ms: maxLag });
+    maxLag = 0;
+  }, 5000).unref();
+}
+
 /**
  * Filter untuk modul metrics (SBU TEST, Type Quality). Nilai dipilih acak dari kombinasi yang berisi data.
  *

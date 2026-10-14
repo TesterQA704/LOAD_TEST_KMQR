@@ -75,6 +75,22 @@ function readFailures(jsonFile, runLog) {
   }).filter((f) => f.time).sort((a, b) => a.time - b.time);
 }
 
+/** Kondisi laptop & probe server tiap 5 detik (<nama>.client.jsonl, ditulis run.js). null kalau run lama. */
+function readClient(jsonFile) {
+  const file = jsonFile.replace(/\.json$/i, '.client.jsonl');
+  if (!fs.existsSync(file)) return null;
+  const rows = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  return rows.length ? rows : null;
+}
+
+// Batas "laptop kewalahan": di atas ini hasil test bisa terdistorsi oleh laptop, bukan server
+const CLIENT_LIMITS = { cpu: 90, freeMb: 700, lagMs: 1000 };
+const median = (arr) => {
+  if (!arr.length) return null;
+  const v = [...arr].sort((a, b) => a - b);
+  return v[Math.floor(v.length / 2)];
+};
+
 /** Line chart SVG sederhana. series = [{ name, color, points: [[x, y], ...] }], overlay = { phases, failures } */
 function lineChart(title, series, yFmt = (v) => +v.toFixed(1), overlay = {}) {
   const W = 640, H = 220, L = 56, R = 12, T = 12, B = 28;
@@ -272,27 +288,113 @@ function build(file) {
   };
   const utc = (t) => new Date(t).toISOString().slice(11, 19);
 
+  // ---------- Klien vs server ----------
+  const client = readClient(file);
+  const probeOkMs = client ? client.filter((x) => typeof x.probeStatus === 'number' && x.probeStatus < 500).map((x) => x.probeMs) : [];
+  const probeBase = median(probeOkMs.slice(0, 6));
+  const probeBad = (x) => x.probeStatus != null
+    && (typeof x.probeStatus !== 'number' || x.probeStatus >= 500 || (probeBase != null && x.probeMs > Math.max(probeBase * 3, probeBase + 1500)));
+  const clientBad = (x) => x.cpu >= CLIENT_LIMITS.cpu || x.freeMb < CLIENT_LIMITS.freeMb || x.lagMs >= CLIENT_LIMITS.lagMs;
+  const http5xx = inter.map((p) => [Number(p.period), Object.entries(p.counters || {})
+    .filter(([k]) => /^browser\.page\.codes\.5\d\d$/.test(k)).reduce((sum, [, v]) => sum + v, 0)]);
+  const total5xx = http5xx.reduce((sum, [, n]) => sum + n, 0);
+
+  /** Tentukan sisi penyebab satu kegagalan dari sinyal di jendela waktu aksi yang gagal. */
+  const classify = (f) => {
+    const from = f.time - (timeoutOf(f.error) || 0) - 5000;
+    const until = f.time + 5000;
+    const server = [];
+    const laptop = [];
+    if (f.cause && /circuit/i.test(f.cause)) server.push('circuit Blazor dimatikan server');
+    else if (f.cause) server.push(`${f.cause} (server/jaringan)`);
+    const n5xx = http5xx.filter(([t, n]) => n && t + 10000 >= from && t <= until).reduce((sum, [, n]) => sum + n, 0);
+    if (n5xx) server.push(`${n5xx} respons HTTP 5xx`);
+    if (client) {
+      const win = client.filter((x) => x.t >= from && x.t <= until);
+      const slow = win.filter(probeBad);
+      if (slow.length) server.push(`probe server lambat/error (maks ${ms(Math.max(...slow.map((x) => x.probeMs)))})`);
+      if (win.length) {
+        const cpuMax = Math.max(...win.map((x) => x.cpu));
+        const freeMin = Math.min(...win.map((x) => x.freeMb));
+        const lagMax = Math.max(...win.map((x) => x.lagMs || 0));
+        if (cpuMax >= CLIENT_LIMITS.cpu) laptop.push(`CPU laptop ${cpuMax}%`);
+        if (freeMin < CLIENT_LIMITS.freeMb) laptop.push(`RAM bebas ${freeMin} MB`);
+        if (lagMax >= CLIENT_LIMITS.lagMs) laptop.push(`lag laptop ${ms(lagMax)}`);
+      }
+    }
+    const reasons = [...server, ...laptop];
+    if (server.length && laptop.length) return { cls: 'both', label: 'Keduanya', reasons };
+    if (server.length) return { cls: 'server', label: 'Server', reasons };
+    if (laptop.length) return { cls: 'client', label: 'Laptop', reasons };
+    if (client) return { cls: 'server', label: 'Kemungkinan aplikasi', reasons: ['laptop sehat dan probe server normal: masalah di sesi itu saja (mis. exception per user)'] };
+    return { cls: 'unknown', label: 'Belum bisa ditentukan', reasons: ['run lama: kondisi laptop tidak direkam'] };
+  };
+
+  let validityHtml = `<div class="card note"><p class="muted">Kondisi laptop tidak direkam pada run ini (run sebelum fitur ini). Jalankan ulang lewat <code>npm run …</code> untuk mendapat penilaian klien vs server.</p></div>`;
+  if (client) {
+    const badSamples = client.filter(clientBad);
+    const badPct = Math.round((100 * badSamples.length) / client.length);
+    // gabungkan sampel jenuh berurutan menjadi rentang waktu
+    const ranges = [];
+    for (const x of badSamples) {
+      const last = ranges[ranges.length - 1];
+      if (last && x.t - last.end <= 10000) {
+        last.end = x.t;
+        last.cpu = Math.max(last.cpu, x.cpu);
+        last.freeMb = Math.min(last.freeMb, x.freeMb);
+        last.lag = Math.max(last.lag, x.lagMs || 0);
+      } else ranges.push({ start: x.t, end: x.t, cpu: x.cpu, freeMb: x.freeMb, lag: x.lagMs || 0 });
+    }
+    const rangeText = ranges.slice(0, 6).map((r) => `${fmtClock(r.start)}–${fmtClock(r.end)} (CPU maks ${r.cpu}%, RAM bebas min ${r.freeMb} MB, lag maks ${ms(r.lag)})`).join('; ');
+    const slowProbes = client.filter(probeBad).length;
+    const verdict = badPct === 0
+      ? `<p class="ok">✓ <b>Laptop tidak menjadi bottleneck selama test.</b> Kelambatan atau kegagalan yang tercatat (kalau ada) berasal dari server/aplikasi, jadi hasil ini valid sebagai ukuran server.</p>`
+      : badPct < 10
+        ? `<p class="warn">⚠ <b>Laptop sempat kewalahan ${badPct}% dari waktu test</b> di rentang: ${rangeText}. Hasil di rentang itu kurang valid; di luar rentang itu valid.</p>`
+        : `<p class="bad">✗ <b>Laptop kewalahan ${badPct}% dari waktu test</b> (${rangeText}). Hasil ini tidak valid sebagai ukuran server: kurangi jumlah VU, bebaskan RAM, atau jalankan dari mesin yang lebih kuat.</p>`;
+    const serverLine = `<p>Server: probe HTTP baseline <b>${ms(probeBase)}</b>, maks <b>${ms(Math.max(...client.map((x) => x.probeMs || 0)))}</b>, ${slowProbes ? `<b class="bad">${slowProbes} sampel lambat/error</b>` : '0 sampel lambat'}; respons HTTP 5xx: <b>${total5xx}</b>.</p>`;
+    const laptopLine = `<p>Laptop: CPU maks <b>${Math.max(...client.map((x) => x.cpu))}%</b>, RAM bebas min <b>${Math.min(...client.map((x) => x.freeMb))} MB</b>, lag maks <b>${ms(Math.max(...client.map((x) => x.lagMs || 0)))}</b> (batas: CPU ${CLIENT_LIMITS.cpu}%, RAM ${CLIENT_LIMITS.freeMb} MB, lag ${ms(CLIENT_LIMITS.lagMs)}).</p>`;
+    const clientCharts = [
+      lineChart('Laptop (klien): CPU & RAM', [
+        { name: 'CPU %', color: COLORS[2], points: client.map((x) => [x.t, x.cpu]) },
+        { name: 'RAM terpakai %', color: COLORS[3], points: client.map((x) => [x.t, x.ramUsedPct]) },
+      ], (v) => `${Math.round(v)}%`, overlay),
+      lineChart('Probe server vs lag laptop', [
+        { name: 'probe server', color: COLORS[1], points: client.filter((x) => x.probeMs != null).map((x) => [x.t, x.probeMs]) },
+        { name: 'lag laptop', color: COLORS[4], points: client.map((x) => [x.t, x.lagMs || 0]) },
+      ], ms, overlay),
+    ].join('');
+    validityHtml = `<div class="card note">${verdict}${serverLine}${laptopLine}
+<p class="muted">Cara baca: kalau <b>probe server</b> naik saat beban naik, server melambat. Kalau probe tetap rendah tapi <b>CPU/lag laptop</b> tinggi, laptop yang melambat.</p></div>
+<div class="charts" style="margin-top:12px">${clientCharts}</div>`;
+  }
+
   let failuresHtml = '<p class="muted">Tidak ada VU yang gagal.</p>';
   if (failures.length) {
     const byPhase = {};
     failures.forEach((f) => { const p = phaseAt(f.time); byPhase[p] = (byPhase[p] || 0) + 1; });
     const circuit = failures.filter((f) => /circuit/i.test(f.cause || '')).length;
+    failures.forEach((f) => { f.side = classify(f); });
+    const bySide = {};
+    failures.forEach((f) => { bySide[f.side.label] = (bySide[f.side.label] || 0) + 1; });
+    const sideBadge = (sd) => `<span class="side ${sd.cls}">${esc(sd.label)}</span>`;
     const groups = {};
     failures.forEach((f) => {
-      const key = `${f.step}|${f.error}|${causeOf(f)}`;
-      groups[key] = groups[key] || { step: f.step, error: f.error, cause: causeOf(f), n: 0, phases: new Set() };
+      const key = `${f.step}|${f.error}|${causeOf(f)}|${f.side.label}`;
+      groups[key] = groups[key] || { step: f.step, error: f.error, cause: causeOf(f), side: f.side, n: 0, phases: new Set() };
       groups[key].n++;
       groups[key].phases.add(phaseAt(f.time));
     });
     const summary = [
       `<b>${failures.length} VU gagal</b> antara ${fmtClock(failures[0].time)} (${fmtOffset(failures[0].time - testStart)}) dan ${fmtClock(failures[failures.length - 1].time)} (${fmtOffset(failures[failures.length - 1].time - testStart)}).`,
       `Per phase: ${Object.entries(byPhase).map(([p, n]) => `${esc(p)} ${n}×`).join(', ')}.`,
+      `Per sisi penyebab: ${Object.entries(bySide).map(([lbl, n]) => `${esc(lbl)} ${n}×`).join(', ')}.`,
       circuit ? `<b>${circuit}</b> di antaranya didahului <b>circuit Blazor dimatikan server</b>: cocokkan jamnya (kolom UTC) dengan exception di log pod.` : '',
       failures.some((f) => timeoutOf(f.error)) ? 'Untuk error timeout, screenshot diambil setelah timeout habis; kolom "mulai macet" menunjukkan kapan aksi itu mulai menunggu.' : '',
     ].filter(Boolean).map((t) => `<p>${t}</p>`).join('');
 
     const groupRows = Object.values(groups).sort((a, b) => b.n - a.n).map((g) =>
-      `<tr><td>${esc(g.step)}</td><td class="wrap">${esc(g.error)}</td><td class="wrap">${esc(g.cause)}</td><td>${[...g.phases].map(esc).join(', ')}</td><td><b>${g.n}</b></td></tr>`).join('');
+      `<tr><td>${esc(g.step)}</td><td class="wrap">${esc(g.error)}</td><td class="wrap">${esc(g.cause)}</td><td>${sideBadge(g.side)}</td><td>${[...g.phases].map(esc).join(', ')}</td><td><b>${g.n}</b></td></tr>`).join('');
 
     const detailRows = failures.map((f, i) => {
       const to = timeoutOf(f.error);
@@ -302,14 +404,15 @@ function build(file) {
       return `<tr><td>${i + 1}</td><td>${fmtClock(f.time)}<div class="muted">${utc(f.time)} UTC</div></td><td>${fmtOffset(f.time - testStart)}</td>`
         + `<td>${esc(phaseAt(f.time))}</td><td>${activeAt(f.time)}</td><td>${to ? fmtClock(f.time - to) : '-'}</td>`
         + `<td>${esc(f.vu)}<div class="muted">${esc((f.user || '').split('@')[0])}</div></td><td>${esc(f.step)}</td>`
-        + `<td class="wrap">${esc(f.error)}${consoleInfo}</td><td class="wrap">${esc(causeOf(f))}</td><td>${shot}</td></tr>`;
+        + `<td class="wrap">${esc(f.error)}${consoleInfo}</td><td class="wrap">${esc(causeOf(f))}</td>`
+        + `<td class="wrap">${sideBadge(f.side)}<div class="muted">${esc(f.side.reasons.join('; '))}</div></td><td>${shot}</td></tr>`;
     }).join('');
 
     failuresHtml = `<div class="card note">${summary}</div>
 <h3>Ringkasan penyebab</h3>
-<div class="card"><table><tr><th>Langkah</th><th>Error</th><th>Penyebab terdeteksi</th><th>Phase</th><th>Jumlah</th></tr>${groupRows}</table></div>
+<div class="card"><table><tr><th>Langkah</th><th>Error</th><th>Penyebab terdeteksi</th><th>Sisi</th><th>Phase</th><th>Jumlah</th></tr>${groupRows}</table></div>
 <h3>Detail per VU</h3>
-<div class="card"><table><tr><th>#</th><th>Jam gagal</th><th>Menit ke</th><th>Phase</th><th>VU aktif</th><th>Mulai macet</th><th>VU</th><th>Langkah</th><th>Error</th><th>Penyebab</th><th>Screenshot</th></tr>${detailRows}</table></div>`;
+<div class="card"><table><tr><th>#</th><th>Jam gagal</th><th>Menit ke</th><th>Phase</th><th>VU aktif</th><th>Mulai macet</th><th>VU</th><th>Langkah</th><th>Error</th><th>Penyebab</th><th>Sisi</th><th>Screenshot</th></tr>${detailRows}</table></div>`;
   }
 
   const head = '<tr><th>Langkah</th><th>n</th><th>min</th><th>median</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr>';
@@ -338,6 +441,12 @@ th:first-child,td:first-child{text-align:left}th{font-weight:600;color:var(--mut
 .fail-mark{fill:var(--bad)}.fail-legend{display:inline-block;width:0!important;height:0!important;border-radius:0!important;background:none!important;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:9px solid var(--bad)}
 .tip-fail{color:var(--bad)}
 h3{font-size:14px;margin:18px 0 8px}.note{padding:4px 14px}.note p{margin:8px 0}
+.note .ok{color:var(--good)}.note .warn{color:var(--warn)}.note .bad,b.bad{color:var(--bad)}
+.side{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.side.server{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.side.client{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.side.both{background:color-mix(in srgb,#9b5de5 18%,transparent);color:#9b5de5}
+.side.unknown{background:color-mix(in srgb,var(--muted) 18%,transparent);color:var(--muted)}
 .checks{padding:10px 14px}.checks .ok{color:var(--good)}.checks .bad{color:var(--bad)}
 .status{display:inline-block;padding:2px 10px;border-radius:999px;font-weight:600;font-size:13px;margin-left:8px;vertical-align:3px}
 .status.ok{background:color-mix(in srgb,var(--good) 18%,transparent);color:var(--good)}.status.bad{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)}
@@ -350,6 +459,7 @@ pre{white-space:pre-wrap;font-size:11px;margin:4px 0 0;max-width:420px}a{color:#
 <div class="tiles">${tiles}</div>
 <h2>Checks</h2>${checksHtml}
 <h2>Grafik</h2><div class="charts">${charts}</div>
+<h2>Validitas: laptop atau server?</h2>${validityHtml}
 <h2>VU gagal</h2>${failuresHtml}
 <h2>Waktu per langkah</h2><div class="card"><table>${head}${stepRows}</table></div>
 <h2>Web vitals halaman</h2><div class="card"><table>${head.replace('Langkah', 'Metrik')}${vitalRows}</table></div>

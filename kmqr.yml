@@ -9,7 +9,7 @@
 # Contoh: 1 sesi ≈ 50 detik, arrivalCount 30 dalam 300 detik (1 user / 10 detik) → ±5 user bersamaan.
 
 config:
-  target: https://stg-kmqr.kalbe.co.id
+  target: https://kmqr.kalbe.co.id
   processor: ./flows.js
 
   engines:
@@ -80,11 +80,11 @@ config:
         - name: level-5
           duration: 180
           arrivalCount: 18
-          maxVusers: 5
+          maxVusers: 15
         - name: level-10
           duration: 180
           arrivalCount: 36
-          maxVusers: 10
+          maxVusers: 18
         - name: level-20
           duration: 180
           arrivalCount: 72

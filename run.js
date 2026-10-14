@@ -78,6 +78,12 @@ const state = {
   cpuMax: 0,
   freeMinGb: null,
   skipped: 0,
+  lagMs: 0, // lag event loop proses browser (dari flows.js), maks per 5 detik
+  lagMax: 0,
+  probeMs: null, // waktu respons probe HTTP ke server
+  probeStatus: null,
+  probeOk: [], // sampel probe yang berhasil, untuk baseline
+  probeMax: 0,
 };
 
 // CPU laptop (klien): kalau mendekati 100%, laptop yang jadi bottleneck, bukan server
@@ -104,6 +110,54 @@ setInterval(() => {
 
 const CPU_WARN = 85;
 const RAM_WARN_GB = 1.5;
+const LAG_WARN_MS = 1000;
+
+/**
+ * Probe server: 1 request GET ringan tiap 5 detik, terpisah dari browser VU.
+ * Kalau probe ikut melambat/error saat beban naik, servernya yang melambat.
+ * Kalau probe tetap cepat tapi langkah VU lambat dan CPU/lag laptop tinggi, laptop yang jadi bottleneck.
+ */
+async function probeServer() {
+  const t0 = Date.now();
+  try {
+    const res = await fetch(new URL('/Auth/Login', target), { signal: AbortSignal.timeout(10000), redirect: 'manual' });
+    state.probeMs = Date.now() - t0;
+    state.probeStatus = res.status;
+    res.body?.cancel().catch(() => {});
+    if (res.status < 500) state.probeOk.push(state.probeMs);
+  } catch (err) {
+    state.probeMs = Date.now() - t0;
+    state.probeStatus = err.name === 'TimeoutError' ? 'timeout' : 'error';
+  }
+  state.probeMax = Math.max(state.probeMax, state.probeMs);
+}
+const probeBaseline = () => {
+  const first = state.probeOk.slice(0, 6).sort((a, b) => a - b);
+  return first.length ? first[Math.floor(first.length / 2)] : null;
+};
+const probeSlow = () => {
+  const base = probeBaseline();
+  if (typeof state.probeStatus !== 'number' || state.probeStatus >= 500) return state.probeStatus != null;
+  return base != null && state.probeMs > Math.max(base * 3, base + 1500);
+};
+
+// Kondisi laptop & server tiap 5 detik -> <nama>.client.jsonl (dibaca report.js untuk memisahkan masalah klien vs server)
+let clientLog = null;
+setInterval(async () => {
+  if (!state.testStartedAt || !clientLog) return;
+  await probeServer();
+  const free = os.freemem();
+  fs.appendFileSync(clientLog, `${JSON.stringify({
+    t: Date.now(),
+    cpu: state.cpu,
+    ramUsedPct: Math.round(100 * (1 - free / os.totalmem())),
+    freeMb: Math.round(free / 1048576),
+    lagMs: state.lagMs,
+    probeMs: state.probeMs,
+    probeStatus: state.probeStatus,
+    activeVus: state.started - state.done - state.failed,
+  })}\n`);
+}, 5000).unref();
 
 // Perkiraan RAM puncak: browser ±0.5 GB (termasuk Node/Artillery) + ±0.15 GB per VU bersamaan (diukur di KMQR)
 const GB_PER_VU = 0.15;
@@ -144,6 +198,10 @@ function onEvent(e) {
     case 'vu_done':
       state.done++;
       state.samples.session.push(e.ms);
+      break;
+    case 'lag':
+      state.lagMs = e.ms;
+      if (state.testStartedAt) state.lagMax = Math.max(state.lagMax, e.ms);
       break;
   }
 }
@@ -197,8 +255,15 @@ function frame() {
   const freeText = `RAM free ${freeGb.toFixed(1)} GB`;
   const ramText = freeGb < RAM_WARN_GB ? red(`${freeText} (low)`) : freeText;
   const minText = state.freeMinGb == null ? '' : `  ·  min ${state.freeMinGb.toFixed(1)} GB`;
-  lines.push(`${dim('client')}      ${cpuText}  ·  max ${state.cpuMax}%  ·  ${ramText}${minText}`);
+  const lagText = state.lagMs >= LAG_WARN_MS ? yellow(`lag ${fmtMs(state.lagMs)}`) : `lag ${fmtMs(state.lagMs)}`;
+  lines.push(`${dim('client')}      ${cpuText}  ·  max ${state.cpuMax}%  ·  ${ramText}${minText}  ·  ${lagText}`);
   if (state.skipped) lines.push(`${dim('')}            ${red(`${state.skipped} VU(s) skipped because laptop RAM was low`)}`);
+  if (state.probeMs != null) {
+    const base = probeBaseline();
+    const now = typeof state.probeStatus === 'number' && state.probeStatus < 500 ? fmtMs(state.probeMs) : `${state.probeStatus}`;
+    const probeText = probeSlow() ? red(`probe ${now} (slow/error)`) : `probe ${now}`;
+    lines.push(`${dim('server')}      ${probeText}  ·  baseline ${fmtMs(base)}  ·  max ${fmtMs(state.probeMax)}`);
+  }
   lines.push('');
 
   lines.push(dim(`${'step'.padEnd(18)}${'n'.padStart(5)}${'median'.padStart(10)}${'p95'.padStart(10)}${'max'.padStart(10)}`));
@@ -281,6 +346,7 @@ function plainStatus() {
 // ---------- jalankan artillery ----------
 fs.mkdirSync(RESULTS_DIR, { recursive: true });
 const log = fs.createWriteStream(logPath);
+clientLog = path.join(RESULTS_DIR, `${baseName}.client.jsonl`);
 
 const child = spawn(process.execPath, [ARTILLERY, 'run', CONFIG_FILE, '-e', ENV, '-o', jsonPath, ...EXTRA], {
   cwd: __dirname,

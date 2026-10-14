@@ -119,6 +119,25 @@ Filter metrics (`METRICS_FILTERS` di `flows.js`), dipilih acak dari kombinasi ya
 > Kalau mengubah filter, pastikan dulu dokumennya sudah ada di Document List.
 > Sebagai pengaman, VU langsung gagal (dan tercatat) kalau setelah REFRESH muncul snackbar "saved".
 
+## Gagal karena server atau karena laptop?
+
+Setiap 5 detik `run.js` merekam ke `results/<nama>.client.jsonl`:
+
+- **Kondisi laptop**: CPU, RAM bebas, dan *lag* proses browser (seberapa terlambat laptop menjalankan perintah Playwright).
+- **Probe server**: 1 request GET ringan ke halaman login, terpisah dari browser VU, untuk mengukur respons server secara independen.
+
+Report membandingkan keduanya di bagian **"Validitas: laptop atau server?"** dan memberi label **Sisi** pada setiap VU yang gagal:
+
+| Label | Artinya |
+|---|---|
+| Server | Ada sinyal server di jendela waktu kegagalan: circuit Blazor dimatikan server, HTTP 5xx, atau probe server lambat/error |
+| Laptop | CPU laptop ≥ 90%, RAM bebas < 700 MB, atau lag ≥ 1 s, tanpa sinyal server |
+| Keduanya | Ada sinyal server dan laptop sekaligus: perbaiki kondisi laptop lalu ulangi test |
+| Kemungkinan aplikasi | Laptop sehat dan probe normal: masalah hanya di sesi user itu (mis. exception per circuit) |
+
+Kalau report menyatakan **"Laptop tidak menjadi bottleneck"**, hasilnya valid sebagai ukuran server.
+Untuk bukti dari sisi server, cocokkan jam kegagalan (kolom UTC) dengan log pod dan monitoring CPU/RAM pod/database dari tim infra.
+
 ## Konsep penting: model "arrival"
 
 Berbeda dengan k6 (jumlah VU tetap dan berulang), di Artillery **setiap VU datang, menjalankan 1 sesi, lalu selesai**.
