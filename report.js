@@ -85,6 +85,8 @@ function readClient(jsonFile) {
 
 // Batas "laptop kewalahan": di atas ini hasil test bisa terdistorsi oleh laptop, bukan server
 const CLIENT_LIMITS = { cpu: 90, freeMb: 700, lagMs: 1000 };
+// Error browser yang berarti laptop tidak bisa mencapai server sama sekali (DNS/jaringan/VPN)
+const BROWSER_NET_ERR = /ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED|ERR_ADDRESS_UNREACHABLE/;
 const median = (arr) => {
   if (!arr.length) return null;
   const v = [...arr].sort((a, b) => a - b);
@@ -292,9 +294,14 @@ function build(file) {
   const client = readClient(file);
   const probeOkMs = client ? client.filter((x) => typeof x.probeStatus === 'number' && x.probeStatus < 500).map((x) => x.probeMs) : [];
   const probeBase = median(probeOkMs.slice(0, 6));
-  const probeBad = (x) => x.probeStatus != null
+  // dns:* / jaringan tak terjangkau = laptop tidak bisa mencapai server (VPN/DNS), bukan kesalahan server
+  const probeNetErr = (x) => typeof x.probeStatus === 'string' && (x.probeStatus.startsWith('dns:') || /ENETUNREACH|EHOSTUNREACH/.test(x.probeStatus));
+  const probeBad = (x) => x.probeStatus != null && x.probeStatus !== 'error' && !probeNetErr(x) // 'error' polos = run lama, jenisnya tidak diketahui
     && (typeof x.probeStatus !== 'number' || x.probeStatus >= 500 || (probeBase != null && x.probeMs > Math.max(probeBase * 3, probeBase + 1500)));
-  const clientBad = (x) => x.cpu >= CLIENT_LIMITS.cpu || x.freeMb < CLIENT_LIMITS.freeMb || x.lagMs >= CLIENT_LIMITS.lagMs;
+  // Lag di 10 detik pertama diabaikan: itu waktu Chromium dibuka, bukan tanda laptop kewalahan
+  const warmupUntil = client ? client[0].t + 10000 : 0;
+  const lagOf = (x) => (x.t > warmupUntil ? x.lagMs || 0 : 0);
+  const clientBad = (x) => x.cpu >= CLIENT_LIMITS.cpu || x.freeMb < CLIENT_LIMITS.freeMb || lagOf(x) >= CLIENT_LIMITS.lagMs || probeNetErr(x);
   const http5xx = inter.map((p) => [Number(p.period), Object.entries(p.counters || {})
     .filter(([k]) => /^browser\.page\.codes\.5\d\d$/.test(k)).reduce((sum, [, v]) => sum + v, 0)]);
   const total5xx = http5xx.reduce((sum, [, n]) => sum + n, 0);
@@ -305,6 +312,7 @@ function build(file) {
     const until = f.time + 5000;
     const server = [];
     const laptop = [];
+    if (BROWSER_NET_ERR.test(f.error)) laptop.push('browser tidak bisa mencapai server (DNS/jaringan laptop)');
     if (f.cause && /circuit/i.test(f.cause)) server.push('circuit Blazor dimatikan server');
     else if (f.cause) server.push(`${f.cause} (server/jaringan)`);
     const n5xx = http5xx.filter(([t, n]) => n && t + 10000 >= from && t <= until).reduce((sum, [, n]) => sum + n, 0);
@@ -313,10 +321,12 @@ function build(file) {
       const win = client.filter((x) => x.t >= from && x.t <= until);
       const slow = win.filter(probeBad);
       if (slow.length) server.push(`probe server lambat/error (maks ${ms(Math.max(...slow.map((x) => x.probeMs)))})`);
+      const netErr = win.find(probeNetErr);
+      if (netErr) laptop.push(`jaringan laptop tidak bisa mencapai server (${netErr.probeStatus})`);
       if (win.length) {
         const cpuMax = Math.max(...win.map((x) => x.cpu));
         const freeMin = Math.min(...win.map((x) => x.freeMb));
-        const lagMax = Math.max(...win.map((x) => x.lagMs || 0));
+        const lagMax = Math.max(...win.map(lagOf));
         if (cpuMax >= CLIENT_LIMITS.cpu) laptop.push(`CPU laptop ${cpuMax}%`);
         if (freeMin < CLIENT_LIMITS.freeMb) laptop.push(`RAM bebas ${freeMin} MB`);
         if (lagMax >= CLIENT_LIMITS.lagMs) laptop.push(`lag laptop ${ms(lagMax)}`);
@@ -342,18 +352,25 @@ function build(file) {
         last.end = x.t;
         last.cpu = Math.max(last.cpu, x.cpu);
         last.freeMb = Math.min(last.freeMb, x.freeMb);
-        last.lag = Math.max(last.lag, x.lagMs || 0);
-      } else ranges.push({ start: x.t, end: x.t, cpu: x.cpu, freeMb: x.freeMb, lag: x.lagMs || 0 });
+        last.lag = Math.max(last.lag, lagOf(x));
+      } else ranges.push({ start: x.t, end: x.t, cpu: x.cpu, freeMb: x.freeMb, lag: lagOf(x) });
     }
     const rangeText = ranges.slice(0, 6).map((r) => `${fmtClock(r.start)}–${fmtClock(r.end)} (CPU maks ${r.cpu}%, RAM bebas min ${r.freeMb} MB, lag maks ${ms(r.lag)})`).join('; ');
     const slowProbes = client.filter(probeBad).length;
-    const verdict = badPct === 0
+    const netErrs = client.filter(probeNetErr);
+    const browserNetFails = failures.filter((f) => BROWSER_NET_ERR.test(f.error));
+    const netWhat = netErrs.length
+      ? `${netErrs.length} dari ${client.length} sampel probe (${esc(netErrs[0].probeStatus)}, pertama ${fmtClock(netErrs[0].t)})`
+      : `${browserNetFails.length} VU (${esc((browserNetFails[0]?.error.match(BROWSER_NET_ERR) || [''])[0])}, pertama ${browserNetFails.length ? fmtClock(browserNetFails[0].time) : '-'})`;
+    const verdict = netErrs.length || browserNetFails.length
+      ? `<p class="bad">✗ <b>Laptop tidak bisa mencapai server</b> pada ${netWhat}. Ini masalah jaringan/DNS di laptop (mis. belum tersambung VPN/jaringan kantor), bukan server. Hasil test tidak valid: perbaiki koneksi lalu ulangi.</p>`
+      : badPct === 0
       ? `<p class="ok">✓ <b>Laptop tidak menjadi bottleneck selama test.</b> Kelambatan atau kegagalan yang tercatat (kalau ada) berasal dari server/aplikasi, jadi hasil ini valid sebagai ukuran server.</p>`
       : badPct < 10
         ? `<p class="warn">⚠ <b>Laptop sempat kewalahan ${badPct}% dari waktu test</b> di rentang: ${rangeText}. Hasil di rentang itu kurang valid; di luar rentang itu valid.</p>`
         : `<p class="bad">✗ <b>Laptop kewalahan ${badPct}% dari waktu test</b> (${rangeText}). Hasil ini tidak valid sebagai ukuran server: kurangi jumlah VU, bebaskan RAM, atau jalankan dari mesin yang lebih kuat.</p>`;
     const serverLine = `<p>Server: probe HTTP baseline <b>${ms(probeBase)}</b>, maks <b>${ms(Math.max(...client.map((x) => x.probeMs || 0)))}</b>, ${slowProbes ? `<b class="bad">${slowProbes} sampel lambat/error</b>` : '0 sampel lambat'}; respons HTTP 5xx: <b>${total5xx}</b>.</p>`;
-    const laptopLine = `<p>Laptop: CPU maks <b>${Math.max(...client.map((x) => x.cpu))}%</b>, RAM bebas min <b>${Math.min(...client.map((x) => x.freeMb))} MB</b>, lag maks <b>${ms(Math.max(...client.map((x) => x.lagMs || 0)))}</b> (batas: CPU ${CLIENT_LIMITS.cpu}%, RAM ${CLIENT_LIMITS.freeMb} MB, lag ${ms(CLIENT_LIMITS.lagMs)}).</p>`;
+    const laptopLine = `<p>Laptop: CPU maks <b>${Math.max(...client.map((x) => x.cpu))}%</b>, RAM bebas min <b>${Math.min(...client.map((x) => x.freeMb))} MB</b>, lag maks <b>${ms(Math.max(...client.map(lagOf)))}</b> (batas: CPU ${CLIENT_LIMITS.cpu}%, RAM ${CLIENT_LIMITS.freeMb} MB, lag ${ms(CLIENT_LIMITS.lagMs)}).</p>`;
     const clientCharts = [
       lineChart('Laptop (klien): CPU & RAM', [
         { name: 'CPU %', color: COLORS[2], points: client.map((x) => [x.t, x.cpu]) },

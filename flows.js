@@ -44,23 +44,43 @@ if (LIVE) {
   }, 5000).unref();
 }
 
+const ALL_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
 /**
- * Filter untuk modul metrics (SBU TEST, Type Quality). Nilai dipilih acak dari kombinasi yang berisi data.
+ * Data test per environment, dipilih otomatis dari domain yang dites (lihat profileFor).
+ * Nilai filter dipilih acak dari kombinasi yang berisi data.
+ *
+ * refresh per modul metrics:
+ *   'rows'       = REFRESH lalu tunggu tabel berisi data (default)
+ *   'notFoundOk' = REFRESH, snackbar "Document not found" juga dihitung respons server yang sah
+ *   'off'        = halaman hanya dibuka, tanpa filter & REFRESH
  *
  * PENTING: REFRESH di Metrics Result Input MEMBUAT draft dokumen baru kalau dokumen bulan tersebut belum ada.
- * Karena itu Result Input/Review hanya memakai Year 2027 + Site FinalTest, yang dokumennya sudah ada untuk
- * Jan-Dec. Kalau mengubah nilai di sini, pastikan dulu dokumennya sudah ada (cek di Document List).
+ * Result Input hanya boleh 'rows' untuk kombinasi yang dokumennya sudah ada (cek di Document List).
  */
-const METRICS_FILTERS = {
-  target: { sbu: 'TEST', type: 'Quality', years: ['2026'], sites: ['test', 'FinalTest'] },
-  result: {
-    sbu: 'TEST',
-    type: 'Quality',
-    years: ['2027'],
-    sites: ['FinalTest'],
-    months: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'],
+const DATA_PROFILES = {
+  // Staging: dokumen Result 2027/FinalTest ada untuk Jan-Dec
+  'stg-kmqr.kalbe.co.id': {
+    target: { sbu: 'TEST', type: 'Quality', years: ['2026'], sites: ['test', 'FinalTest'] },
+    result: { sbu: 'TEST', type: 'Quality', years: ['2027'], sites: ['FinalTest'], months: ALL_MONTHS },
+    refresh: {},
+  },
+  // Production (dicek 14 Okt 2026): satu-satunya data test = dokumen Target Tests/FinalTest/2026.
+  // Belum ada dokumen Result sama sekali, jadi Result Input tidak di-REFRESH; Result Review hanya membaca.
+  'kmqr.kalbe.co.id': {
+    target: { sbu: 'Tests', type: 'Quality', years: ['2026'], sites: ['FinalTest'] },
+    result: { sbu: 'Tests', type: 'Quality', years: ['2026'], sites: ['FinalTest'], months: ALL_MONTHS },
+    refresh: { 'Metrics Result Input': 'off', 'Metrics Result Review': 'notFoundOk' },
   },
 };
+
+function profileFor(url) {
+  const host = new URL(url).hostname;
+  const profile = DATA_PROFILES[host];
+  if (!profile) throw new Error(`No DATA_PROFILES entry for ${host}: add the test data for this environment in flows.js`);
+  return profile;
+}
+const refreshMode = (profile, mod) => (mod.filters ? profile.refresh[mod.name] || 'rows' : 'off');
 
 /**
  * Modul yang dibuka secara acak, hanya aksi baca (jangan isi aksi approve/submit/delete).
@@ -68,19 +88,18 @@ const METRICS_FILTERS = {
  * group   = tombol grup sidebar tempat link berada (harus terbuka supaya link bisa diklik)
  * path    = URL tujuan
  * heading = judul halaman (h5), bisa beda dengan nama menu
- * filters = (khusus metrics) filter yang dipilih lalu REFRESH data
+ * filters = (khusus metrics) jenis filter di DATA_PROFILES ('target' / 'result') yang dipilih lalu REFRESH
  */
 const MODULES = [
-  { name: 'Metrics Target Corporate', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetCorp', heading: 'Metrics Target - Corporate', filters: METRICS_FILTERS.target },
-  { name: 'Metrics Target Site', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetSite', heading: 'Metrics Target - Site', filters: METRICS_FILTERS.target },
-  { name: 'Metrics Target Approval', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetApproval', heading: 'Metrics Target - Approval', filters: METRICS_FILTERS.target },
-  { name: 'Metrics Result Input', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsResultInput', heading: 'Metrics Result - Input', filters: METRICS_FILTERS.result },
-  { name: 'Metrics Result Review', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsResultReview', heading: 'Metrics Result - Review', filters: METRICS_FILTERS.result },
+  { name: 'Metrics Target Corporate', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetCorp', heading: 'Metrics Target - Corporate', filters: 'target' },
+  { name: 'Metrics Target Site', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetSite', heading: 'Metrics Target - Site', filters: 'target' },
+  { name: 'Metrics Target Approval', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsTargetApproval', heading: 'Metrics Target - Approval', filters: 'target' },
+  { name: 'Metrics Result Input', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsResultInput', heading: 'Metrics Result - Input', filters: 'result' },
+  { name: 'Metrics Result Review', group: 'Toggle Metrics Detail', path: '/MetricsDetail/MetricsResultReview', heading: 'Metrics Result - Review', filters: 'result' },
   { name: 'Picapa Sira', group: 'Toggle Dashboard Reporting', path: '/Dashboard/PicapaSira', heading: 'PICAPA/SIRA' },
   { name: 'Audit Trail', group: 'Toggle Dashboard Reporting', path: '/Dashboard/AuditTrail', heading: 'Audit Trail' },
   { name: 'Document List', group: 'Toggle Dashboard Reporting', path: '/Dashboard/DocumentList', heading: 'Document List' },
 ];
-const METRICS_MODULES = MODULES.filter((m) => m.filters);
 
 const MENU_TOGGLES = ['Toggle Metrics Detail', 'Toggle Dashboard Reporting'];
 
@@ -98,8 +117,9 @@ async function think(page) {
 
 const randomOf = (list) => list[Math.floor(Math.random() * list.length)];
 
-/** Pilih modul acak (tidak sama berturut-turut), dengan minimal 1 modul metrics per VU. */
-function pickModules(count) {
+/** Pilih modul acak (tidak sama berturut-turut), dengan minimal 1 modul metrics yang di-REFRESH per VU. */
+function pickModules(count, profile) {
+  const refreshable = MODULES.filter((m) => refreshMode(profile, m) !== 'off');
   const picked = [];
   for (let i = 0; i < count; i++) {
     let mod;
@@ -108,11 +128,21 @@ function pickModules(count) {
     } while (mod === picked[i - 1]);
     picked.push(mod);
   }
-  if (count > 0 && !picked.some((m) => m.filters)) {
+  if (count > 0 && refreshable.length && !picked.some((m) => refreshable.includes(m))) {
     const i = Math.floor(Math.random() * count);
-    picked[i] = randomOf(METRICS_MODULES.filter((m) => m !== picked[i - 1] && m !== picked[i + 1]));
+    picked[i] = randomOf(refreshable.filter((m) => m !== picked[i - 1] && m !== picked[i + 1]));
   }
   return picked;
+}
+
+/**
+ * Beri waktu Blazor tersambung sebelum mengisi form.
+ * Dengan WebSocket (staging) jaringan cepat diam; dengan Long Polling (production, WebSocket ditolak proxy)
+ * selalu ada request terbuka sehingga 'networkidle' tidak pernah tercapai. Jadi tunggu maksimal 3 detik lalu lanjut;
+ * isian yang hilang karena render ulang tetap ditangani fillLoginForm.
+ */
+async function waitForBlazorSettled(page) {
+  await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
 }
 
 function loginElements(page) {
@@ -121,7 +151,8 @@ function loginElements(page) {
     password: page.getByRole('textbox', { name: 'Password*' }),
     signIn: page.locator("xpath=//span[contains(.,'Sign In')]"),
     home: page.getByRole('button', { name: 'Toggle Metrics Detail' }),
-    invalid: page.getByText('Username or Password is invalid'),
+    // Pesan penolakan login: password salah, atau akun belum terdaftar di aplikasi (mis. belum punya akses ke production)
+    invalid: page.getByText(/Username or Password is invalid|does not have access to this website/i).first(),
     loginPage: page.getByText('(Kalbe/Key Metrics - Manufacturing, Quality, Regulatory)'),
   };
 }
@@ -165,7 +196,10 @@ function trackBlazorEvents(page) {
     });
   });
   page.on('request', (req) => {
-    if (req.method() === 'POST' && req.url().includes('/_blazor')) tracker.sent++;
+    // Long Polling juga mengirim ping rutin lewat POST, jadi hanya hitung POST yang berisi event UI
+    if (req.method() !== 'POST' || !req.url().includes('/_blazor')) return;
+    const body = req.postDataBuffer();
+    if (body && body.toString('latin1').includes('BeginInvokeDotNetFromJS')) tracker.sent++;
   });
   return tracker;
 }
@@ -239,7 +273,7 @@ async function login(page, user, events, vuId, blazor) {
     if (start && (await els.home.isVisible())) return success();
 
     try {
-      await page.waitForLoadState('networkidle');
+      await waitForBlazorSettled(page);
       await fillLoginForm(page, els, user, events);
       const clickAt = Date.now();
       await els.signIn.click();
@@ -254,7 +288,8 @@ async function login(page, user, events, vuId, blazor) {
 
     if (result === 'home') return success();
     if (result === 'invalid') {
-      throw new Error('Login rejected: Username or Password is invalid (check data/users.csv)');
+      const message = (await els.invalid.innerText().catch(() => '')).trim() || 'Username or Password is invalid';
+      throw new Error(`Login rejected: "${message}" (check the account in data/users.csv)`);
     }
     if (attempt < LOGIN_ATTEMPTS && RETRY_REASONS[result]) {
       const reason = RETRY_REASONS[result];
@@ -303,7 +338,7 @@ async function selectFilter(page, label, option) {
 /** Isi filter metrics secara acak dari kombinasi yang berisi data. Urutan penting: Year mengubah daftar Site. */
 async function fillMetricsFilters(page, f) {
   const chosen = { year: randomOf(f.years), site: randomOf(f.sites), month: f.months ? randomOf(f.months) : null };
-  if (chosen.year !== '2026') await selectFilter(page, 'Year', chosen.year); // 2026 sudah default
+  await selectFilter(page, 'Year', chosen.year);
   await selectFilter(page, 'SBU', f.sbu);
   await selectFilter(page, 'Site', chosen.site); // daftar Site dimuat setelah SBU dipilih; click() menunggu opsinya muncul
   if (chosen.month) await selectFilter(page, 'Month', chosen.month);
@@ -312,16 +347,18 @@ async function fillMetricsFilters(page, f) {
 }
 
 /**
- * Klik REFRESH lalu tunggu tabel selesai dimuat dan berisi data.
+ * Klik REFRESH lalu tunggu tabel selesai dimuat dan berisi data
+ * (mode 'notFoundOk': snackbar "Document not found" juga dihitung selesai).
  * Gagal kalau muncul snackbar "saved" (Refresh tidak boleh membuat/mengubah data) atau validasi filter.
  */
-async function refreshMetrics(page) {
+async function refreshMetrics(page, mode) {
   await page.getByRole('button', { name: 'REFRESH' }).click();
-  await page.waitForFunction((sel) => {
+  await page.waitForFunction(({ sel, notFoundOk }) => {
     const snack = [...document.querySelectorAll('.mud-snackbar')].map((s) => s.innerText).join(' ');
     if (/saved|please select/i.test(snack)) return true;
-    return !document.querySelector(sel) && document.querySelectorAll('.mud-table tbody tr').length > 0;
-  }, LOADING_SELECTOR);
+    if (document.querySelector(sel)) return false;
+    return document.querySelectorAll('.mud-table tbody tr').length > 0 || (notFoundOk && /document not found/i.test(snack));
+  }, { sel: LOADING_SELECTOR, notFoundOk: mode === 'notFoundOk' });
   const snack = (await page.locator('.mud-snackbar').allInnerTexts()).join(' ').trim();
   if (/saved/i.test(snack)) throw new Error(`REFRESH unexpectedly saved data: "${snack}"`);
   if (/please select/i.test(snack)) throw new Error(`Filter incomplete: "${snack}"`);
@@ -408,9 +445,10 @@ async function kmqrJourney(page, vuContext, events, test) {
       // "/" di-redirect Blazor ke /Auth/Login; isi form sebelum redirect selesai akan hilang
       await page.waitForURL(/\/Auth\/Login/);
       await page.getByRole('textbox', { name: 'Username*' }).waitFor({ state: 'visible' });
-      await page.waitForLoadState('networkidle');
+      await waitForBlazorSettled(page);
     });
     live('step', { vu: vuId, name: 'open_login_page', ms: Date.now() - start });
+    const profile = profileFor(page.url()); // data test staging/production sesuai domain
 
     step = 'login';
     await test.step('login', () => login(page, user, events, vuId, blazor));
@@ -419,7 +457,7 @@ async function kmqrJourney(page, vuContext, events, test) {
     step = 'expand_menu';
     await expandMenus(page);
 
-    for (const mod of pickModules(MODULE_CLICKS)) {
+    for (const mod of pickModules(MODULE_CLICKS, profile)) {
       step = `module_${slug(mod.name)}`;
       start = Date.now();
       await test.step(step, () => openModule(page, mod));
@@ -428,13 +466,14 @@ async function kmqrJourney(page, vuContext, events, test) {
       live('step', { vu: vuId, name: 'module', module: mod.name, ms });
       await think(page);
 
-      if (mod.filters) {
+      const mode = refreshMode(profile, mod);
+      if (mode !== 'off') {
         step = `filter_${slug(mod.name)}`;
-        await fillMetricsFilters(page, mod.filters);
+        await fillMetricsFilters(page, profile[mod.filters]);
 
         step = `refresh_${slug(mod.name)}`;
         start = Date.now();
-        await test.step(step, () => refreshMetrics(page));
+        await test.step(step, () => refreshMetrics(page, mode));
         const refreshMs = Date.now() - start;
         events.emit('histogram', 'kmqr.metrics_refresh', refreshMs);
         live('step', { vu: vuId, name: 'refresh', module: mod.name, ms: refreshMs });

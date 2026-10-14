@@ -107,18 +107,25 @@ Selama test, baris `client` menampilkan RAM bebas. Kalau RAM bebas turun di bawa
    - **Dashboard Reporting** (Picapa Sira, Audit Trail, Document List): hanya dibuka.
 3. Logout.
 
-Filter metrics (`METRICS_FILTERS` di `flows.js`), dipilih acak dari kombinasi yang berisi data:
+Data test per environment ada di `DATA_PROFILES` di `flows.js`, dipilih otomatis dari domain `target` di `kmqr.yml`
+(domain yang tidak terdaftar langsung ditolak). Nilai dipilih acak dari kombinasi yang berisi data:
 
-| Halaman | SBU | Type | Year | Site | Month |
-|---|---|---|---|---|---|
-| Target Corporate / Site / Approval | TEST | Quality | 2026 | test / FinalTest | - |
-| Result Input / Result Review | TEST | Quality | 2027 | FinalTest | Jan–Dec |
+| Environment | Halaman | SBU | Type | Year | Site | Month | REFRESH |
+|---|---|---|---|---|---|---|---|
+| Staging | Target Corporate / Site / Approval | TEST | Quality | 2026 | test / FinalTest | - | ya, tunggu data |
+| Staging | Result Input / Review | TEST | Quality | 2027 | FinalTest | Jan–Dec | ya, tunggu data |
+| Production | Target Corporate / Site / Approval | Tests | Quality | 2026 | FinalTest | - | ya, tunggu data |
+| Production | Result Input | - | - | - | - | - | **tidak** (halaman hanya dibuka) |
+| Production | Result Review | Tests | Quality | 2026 | FinalTest | Jan–Dec | ya, "Document not found" dihitung respons sah |
+
+Production dicek 14 Okt 2026: satu-satunya data test adalah dokumen `KPI-CQA-Target-FinalTest-2026` (SBU Tests). Belum ada dokumen Result sama sekali, jadi Result Input tidak di-REFRESH.
 
 > ⚠️ **REFRESH di Metrics Result Input membuat draft dokumen baru** kalau dokumen untuk Year/Site/Month itu belum ada.
-> Karena itu Result Input/Review hanya memakai 2027/FinalTest, yang dokumennya sudah ada untuk semua bulan.
-> Kalau mengubah filter, pastikan dulu dokumennya sudah ada di Document List.
+> Hanya aktifkan REFRESH Result Input untuk kombinasi yang dokumennya sudah ada di Document List.
 > Sebagai pengaman, VU langsung gagal (dan tercatat) kalau setelah REFRESH muncul snackbar "saved".
 
+> ℹ️ **Production memakai Long Polling, bukan WebSocket**: proxy/ingress production menjawab handshake WebSocket dengan HTTP 200.
+> Setiap user jadi mengirim jauh lebih banyak request (±57 vs 2 di staging per ±13 detik). Ini temuan untuk tim infra.
 ## Gagal karena server atau karena laptop?
 
 Setiap 5 detik `run.js` merekam ke `results/<nama>.client.jsonl`:

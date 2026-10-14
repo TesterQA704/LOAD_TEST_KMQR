@@ -117,6 +117,22 @@ const LAG_WARN_MS = 1000;
  * Kalau probe ikut melambat/error saat beban naik, servernya yang melambat.
  * Kalau probe tetap cepat tapi langkah VU lambat dan CPU/lag laptop tinggi, laptop yang jadi bottleneck.
  */
+/**
+ * Jenis error probe:
+ * - dns:*  -> laptop tidak bisa menemukan alamat server (VPN/jaringan kantor/DNS laptop), BUKAN server
+ * - net:*  -> koneksi ditolak/terputus (server mati, firewall, atau jaringan)
+ * - timeout / tls:* / error:*
+ */
+function probeErrorLabel(err) {
+  if (err.name === 'TimeoutError') return 'timeout';
+  const code = err.cause?.code || err.code || '';
+  if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) return `dns:${code}`;
+  if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENETUNREACH', 'EHOSTUNREACH'].includes(code)) return `net:${code}`;
+  if (/CERT|SSL|TLS/i.test(code)) return `tls:${code}`;
+  return `error:${code || (err.cause?.message || err.message).slice(0, 40)}`;
+}
+const isClientNetworkError = (status) => typeof status === 'string' && (status.startsWith('dns:') || /ENETUNREACH|EHOSTUNREACH/.test(status));
+
 async function probeServer() {
   const t0 = Date.now();
   try {
@@ -127,7 +143,7 @@ async function probeServer() {
     if (res.status < 500) state.probeOk.push(state.probeMs);
   } catch (err) {
     state.probeMs = Date.now() - t0;
-    state.probeStatus = err.name === 'TimeoutError' ? 'timeout' : 'error';
+    state.probeStatus = probeErrorLabel(err);
   }
   state.probeMax = Math.max(state.probeMax, state.probeMs);
 }
@@ -261,7 +277,9 @@ function frame() {
   if (state.probeMs != null) {
     const base = probeBaseline();
     const now = typeof state.probeStatus === 'number' && state.probeStatus < 500 ? fmtMs(state.probeMs) : `${state.probeStatus}`;
-    const probeText = probeSlow() ? red(`probe ${now} (slow/error)`) : `probe ${now}`;
+    const probeText = isClientNetworkError(state.probeStatus)
+      ? yellow(`probe ${now} (laptop network/DNS problem, not the server)`)
+      : probeSlow() ? red(`probe ${now} (slow/error)`) : `probe ${now}`;
     lines.push(`${dim('server')}      ${probeText}  ·  baseline ${fmtMs(base)}  ·  max ${fmtMs(state.probeMax)}`);
   }
   lines.push('');
@@ -344,94 +362,107 @@ function plainStatus() {
 }
 
 // ---------- jalankan artillery ----------
-fs.mkdirSync(RESULTS_DIR, { recursive: true });
-const log = fs.createWriteStream(logPath);
-clientLog = path.join(RESULTS_DIR, `${baseName}.client.jsonl`);
+function startTest() {
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
+  const log = fs.createWriteStream(logPath);
+  clientLog = path.join(RESULTS_DIR, `${baseName}.client.jsonl`);
 
-const child = spawn(process.execPath, [ARTILLERY, 'run', CONFIG_FILE, '-e', ENV, '-o', jsonPath, ...EXTRA], {
-  cwd: __dirname,
-  env: { ...process.env, KMQR_LIVE: '1', FORCE_COLOR: '0', KMQR_FAILURES_FILE: path.join(RESULTS_DIR, `${baseName}.failures.jsonl`) },
-});
-
-function readLines(stream, onLine) {
-  let buf = '';
-  stream.setEncoding('utf8');
-  stream.on('data', (chunk) => {
-    buf += chunk;
-    let i;
-    while ((i = buf.indexOf('\n')) >= 0) {
-      onLine(buf.slice(0, i).replace(/\r$/, ''));
-      buf = buf.slice(i + 1);
-    }
+  const child = spawn(process.execPath, [ARTILLERY, 'run', CONFIG_FILE, '-e', ENV, '-o', jsonPath, ...EXTRA], {
+    cwd: __dirname,
+    env: { ...process.env, KMQR_LIVE: '1', FORCE_COLOR: '0', KMQR_FAILURES_FILE: path.join(RESULTS_DIR, `${baseName}.failures.jsonl`) },
   });
-  stream.on('end', () => buf && onLine(buf));
+
+  function readLines(stream, onLine) {
+    let buf = '';
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => {
+      buf += chunk;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        onLine(buf.slice(0, i).replace(/\r$/, ''));
+        buf = buf.slice(i + 1);
+      }
+    });
+    stream.on('end', () => buf && onLine(buf));
+  }
+
+  readLines(child.stdout, (line) => {
+    if (line.startsWith('@@KMQR ')) {
+      try {
+        onEvent(JSON.parse(line.slice(7)));
+      } catch (_) {
+        /* baris rusak, abaikan */
+      }
+      return;
+    }
+    log.write(`${line}\n`);
+    onArtilleryLine(line);
+  });
+  readLines(child.stderr, (line) => log.write(`${line}\n`));
+
+  if (TTY) process.stdout.write('\x1b[?25l'); // sembunyikan kursor
+  const timer = TTY ? setInterval(draw, 500) : setInterval(plainStatus, 10000);
+  if (TTY) draw();
+
+  // Ctrl+C sampai juga ke Artillery (satu console), jadi cukup tandai; Ctrl+C kedua memaksa berhenti
+  process.on('SIGINT', () => {
+    if (state.stopping) child.kill('SIGKILL');
+    state.stopping = true;
+  });
+
+  child.on('exit', (code) => {
+    clearInterval(timer);
+    log.end();
+    if (TTY) {
+      draw();
+      process.stdout.write('\x1b[?25h');
+    } else {
+      plainStatus();
+    }
+
+    console.log('');
+    if (state.checks.length) {
+      console.log(bold('checks'));
+      for (const c of state.checks) console.log(`  ${c.ok ? green('✓') : red('✗')} ${c.text}`);
+      console.log('');
+    }
+
+    if (state.skipped || (state.freeMinGb != null && state.freeMinGb < RAM_WARN_GB)) {
+      console.log(yellow(`warning     laptop free RAM dropped to ${state.freeMinGb.toFixed(1)} GB${state.skipped ? `, ${state.skipped} VU(s) skipped` : ''}: lower the VU count or free up RAM`));
+      console.log('');
+    }
+    if (state.cpuMax >= CPU_WARN) {
+      console.log(yellow(`warning     client CPU reached ${state.cpuMax}%: slow results may come from this laptop, not the server`));
+      console.log('');
+    }
+    const passed = code === 0;
+    console.log(`${bold('status')}      ${passed ? green('PASSED') : red(`FAILED (exit code ${code})`)}`);
+    if (fs.existsSync(jsonPath)) {
+      try {
+        console.log(`${bold('report')}      ${rel(writeReport(jsonPath))}`);
+      } catch (err) {
+        console.log(`${bold('report')}      ${red(`could not be created: ${err.message}`)}`);
+      }
+    }
+    console.log(`${bold('log')}         ${rel(logPath)}`);
+    if (state.failed) console.log(`${bold('screenshot')}  ${rel(path.join(RESULTS_DIR, 'screenshots'))}`);
+
+    if (!fs.existsSync(jsonPath)) {
+      // Kemungkinan Artillery gagal start: tampilkan akhir log supaya penyebabnya terlihat
+      const tail = fs.readFileSync(logPath, 'utf8').trim().split('\n').slice(-15);
+      if (tail.length) console.log(`\n${dim('end of log:')}\n${tail.join('\n')}`);
+    }
+    process.exit(code == null ? 1 : code);
+  });
 }
 
-readLines(child.stdout, (line) => {
-  if (line.startsWith('@@KMQR ')) {
-    try {
-      onEvent(JSON.parse(line.slice(7)));
-    } catch (_) {
-      /* baris rusak, abaikan */
-    }
-    return;
-  }
-  log.write(`${line}\n`);
-  onArtilleryLine(line);
-});
-readLines(child.stderr, (line) => log.write(`${line}\n`));
-
-if (TTY) process.stdout.write('\x1b[?25l'); // sembunyikan kursor
-const timer = TTY ? setInterval(draw, 500) : setInterval(plainStatus, 10000);
-if (TTY) draw();
-
-// Ctrl+C sampai juga ke Artillery (satu console), jadi cukup tandai; Ctrl+C kedua memaksa berhenti
-process.on('SIGINT', () => {
-  if (state.stopping) child.kill('SIGKILL');
-  state.stopping = true;
-});
-
-child.on('exit', (code) => {
-  clearInterval(timer);
-  log.end();
-  if (TTY) {
-    draw();
-    process.stdout.write('\x1b[?25h');
-  } else {
-    plainStatus();
-  }
-
-  console.log('');
-  if (state.checks.length) {
-    console.log(bold('checks'));
-    for (const c of state.checks) console.log(`  ${c.ok ? green('✓') : red('✗')} ${c.text}`);
-    console.log('');
-  }
-
-  if (state.skipped || (state.freeMinGb != null && state.freeMinGb < RAM_WARN_GB)) {
-    console.log(yellow(`warning     laptop free RAM dropped to ${state.freeMinGb.toFixed(1)} GB${state.skipped ? `, ${state.skipped} VU(s) skipped` : ''}: lower the VU count or free up RAM`));
-    console.log('');
-  }
-  if (state.cpuMax >= CPU_WARN) {
-    console.log(yellow(`warning     client CPU reached ${state.cpuMax}%: slow results may come from this laptop, not the server`));
-    console.log('');
-  }
-  const passed = code === 0;
-  console.log(`${bold('status')}      ${passed ? green('PASSED') : red(`FAILED (exit code ${code})`)}`);
-  if (fs.existsSync(jsonPath)) {
-    try {
-      console.log(`${bold('report')}      ${rel(writeReport(jsonPath))}`);
-    } catch (err) {
-      console.log(`${bold('report')}      ${red(`could not be created: ${err.message}`)}`);
-    }
-  }
-  console.log(`${bold('log')}         ${rel(logPath)}`);
-  if (state.failed) console.log(`${bold('screenshot')}  ${rel(path.join(RESULTS_DIR, 'screenshots'))}`);
-
-  if (!fs.existsSync(jsonPath)) {
-    // Kemungkinan Artillery gagal start: tampilkan akhir log supaya penyebabnya terlihat
-    const tail = fs.readFileSync(logPath, 'utf8').trim().split('\n').slice(-15);
-    if (tail.length) console.log(`\n${dim('end of log:')}\n${tail.join('\n')}`);
-  }
-  process.exit(code == null ? 1 : code);
-});
+// Cek DNS dulu: kalau domain target tidak dikenal (mis. belum tersambung VPN/jaringan kantor), berhenti dengan pesan jelas
+const targetHost = new URL(target).hostname;
+require('dns').promises.lookup(targetHost)
+  .then(() => startTest())
+  .catch((err) => {
+    console.error(red(`Cannot resolve ${targetHost} (${err.code || err.message}).`));
+    console.error('This is a network/DNS problem on this laptop, not the server. Check that you are connected to the');
+    console.error('Kalbe office network or VPN, then verify with:  Resolve-DnsName ' + targetHost);
+    process.exit(2);
+  });
