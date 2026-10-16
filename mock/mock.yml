@@ -1,0 +1,37 @@
+# Load test flows.js terhadap replika lokal KMQR (mock/server.js), tanpa akses ke server asli.
+# Chromium diarahkan ke replika lewat --host-resolver-rules, jadi flows.js tidak perlu diubah.
+# Lihat CLAUDE.md bagian "Replika lokal" untuk cara menjalankan.
+config:
+  target: https://stg-kmqr.kalbe.co.id
+  processor: ../flows.js
+  engines:
+    playwright:
+      aggregateByName: true
+      defaultTimeout: 30
+      defaultNavigationTimeout: 60
+      contextOptions:
+        ignoreHTTPSErrors: true
+      launchOptions:
+        headless: true
+        args:
+          - "--host-resolver-rules=MAP stg-kmqr.kalbe.co.id 127.0.0.1:8443"
+          - "--ignore-certificate-errors"
+  payload:
+    path: ./users.csv
+    fields: [username, password]
+    order: sequence
+    skipHeader: true
+  plugins:
+    ensure: {}
+  ensure:
+    maxErrorRate: 0
+  environments:
+    mock:
+      phases:
+        - name: mock
+          duration: 90
+          arrivalCount: 20
+scenarios:
+  - name: kmqr-user-journey
+    engine: playwright
+    testFunction: kmqrJourney

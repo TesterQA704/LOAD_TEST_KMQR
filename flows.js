@@ -18,6 +18,10 @@ const LOGIN_WAIT = parseFloat(process.env.LOGIN_WAIT || '60'); // detik maksimal
 // Normalnya event terkirim < 100 ms, tapi saat CPU klien penuh (stress) bisa terlambat beberapa detik.
 const CLICK_IGNORED_MS = 5000;
 const LOGIN_SETTLE = parseFloat(process.env.LOGIN_SETTLE || '1'); // detik cek isian form tidak hilang sebelum klik
+// Detik maksimal tunggu server memproses klik UI (toggle menu, pilih filter). Sama dengan defaultTimeout di kmqr.yml.
+const ACTION_WAIT = 30;
+const NAV_WAIT = 60; // detik, sama dengan defaultNavigationTimeout di kmqr.yml
+const MENU_ATTEMPTS = 3;
 const SCREENSHOT_DIR = path.join(__dirname, 'results', 'screenshots');
 // VU baru dilewati kalau RAM bebas laptop di bawah ini (MB), supaya laptop tidak macet/swap. 0 = nonaktif
 const MIN_FREE_RAM_MB = parseInt(process.env.MIN_FREE_RAM_MB || '700', 10);
@@ -101,8 +105,6 @@ const MODULES = [
   { name: 'Document List', group: 'Toggle Dashboard Reporting', path: '/Dashboard/DocumentList', heading: 'Document List' },
 ];
 
-const MENU_TOGGLES = ['Toggle Metrics Detail', 'Toggle Dashboard Reporting'];
-
 // Indikator loading MudBlazor (tabel/progress); halaman dianggap selesai dimuat kalau sudah hilang
 const LOADING_SELECTOR = '.mud-table-loading, .mud-progress-linear, .mud-progress-circular';
 
@@ -145,6 +147,19 @@ async function waitForBlazorSettled(page) {
   await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
 }
 
+/**
+ * Tunggu sampai halaman login terbuka. Tidak memakai page.waitForURL: kalau Blazor memulai redirect ke /Auth/Login
+ * lebih dari sekali, browser membatalkan yang pertama (net::ERR_ABORTED) dan waitForURL ikut error,
+ * padahal redirect berikutnya tetap membuka halaman login.
+ */
+async function waitForLoginUrl(page) {
+  const end = Date.now() + NAV_WAIT * 1000;
+  while (!/\/Auth\/Login/.test(page.url())) {
+    if (Date.now() > end) throw new Error(`Login page not reached within ${NAV_WAIT}s (still at ${page.url()})`);
+    await page.waitForTimeout(100);
+  }
+}
+
 function loginElements(page) {
   return {
     username: page.getByRole('textbox', { name: 'Username*' }),
@@ -185,10 +200,12 @@ async function fillLoginForm(page, els, user, events) {
  * Hitung event UI yang dikirim browser ke server Blazor.
  * Klik yang benar-benar diproses selalu mengirim frame WebSocket "BeginInvokeDotNetFromJS" dalam < 100 ms.
  * Kalau SignalR pindah ke long polling (bisa terjadi saat server sibuk), event dikirim lewat POST /_blazor.
+ * Long Polling hanya mengirim 1 POST sekaligus: selama POST sebelumnya belum dijawab server, event baru ditahan
+ * di browser. Jadi selama ada POST /_blazor yang belum selesai (pending), klik belum tentu diabaikan, bisa jadi masih antre.
  * Harus dipasang sebelum page.goto supaya koneksi Blazor ikut terpantau.
  */
 function trackBlazorEvents(page) {
-  const tracker = { sent: 0 };
+  const tracker = { sent: 0, pending: new Set() };
   page.on('websocket', (ws) => {
     ws.on('framesent', (frame) => {
       const payload = typeof frame.payload === 'string' ? frame.payload : frame.payload.toString('latin1');
@@ -196,13 +213,21 @@ function trackBlazorEvents(page) {
     });
   });
   page.on('request', (req) => {
-    // Long Polling juga mengirim ping rutin lewat POST, jadi hanya hitung POST yang berisi event UI
     if (req.method() !== 'POST' || !req.url().includes('/_blazor')) return;
+    tracker.pending.add(req);
+    // Long Polling juga mengirim ping rutin lewat POST, jadi hanya hitung POST yang berisi event UI
     const body = req.postDataBuffer();
     if (body && body.toString('latin1').includes('BeginInvokeDotNetFromJS')) tracker.sent++;
   });
+  const settled = (req) => tracker.pending.delete(req);
+  page.on('requestfinished', settled);
+  page.on('requestfailed', settled);
   return tracker;
 }
+
+/** Klik dianggap diabaikan Blazor: CLICK_IGNORED_MS berlalu tanpa event terkirim dan tanpa kiriman yang masih antre. */
+const clickIgnored = (blazor, sentBefore, clickedAt) =>
+  blazor.sent === sentBefore && blazor.pending.size === 0 && Date.now() - clickedAt >= CLICK_IGNORED_MS;
 
 /**
  * Tunggu hasil klik Sign In:
@@ -232,7 +257,7 @@ async function waitLoginResult(page, els, blazor) {
       }
       if (navigated) continue; // login sedang diproses (pindah halaman), tunggu saja
 
-      if (blazor.sent === sentBefore && Date.now() - clickedAt >= CLICK_IGNORED_MS) return 'ignored';
+      if (clickIgnored(blazor, sentBefore, clickedAt)) return 'ignored';
       if ((await valueOf(els.username)) === '') {
         emptySince = emptySince || Date.now();
         if (Date.now() - emptySince >= 1000) return 'cleared';
@@ -303,36 +328,62 @@ async function login(page, user, events, vuId, blazor) {
   }
 }
 
-/** Buka grup sidebar kalau masih tertutup. Toggle diklik saat sudah terbuka justru menutupnya. */
-async function openMenuGroup(page, name) {
+/**
+ * Buka grup sidebar sampai link modul terlihat.
+ * Toggle adalah event Blazor: grup baru terbuka setelah server menjawab (round-trip, lebih lama dengan Long Polling
+ * di production atau saat server sibuk). Selama itu aria-expanded masih "false". Klik toggle lagi pada saat itu
+ * membuat server menerima 2 toggle yang saling membatalkan: grup tertutup lagi dan link tidak pernah muncul.
+ * Jadi toggle hanya diklik ulang kalau klik sebelumnya terbukti diabaikan (tidak ada event terkirim/antre).
+ */
+async function openMenuGroup(page, name, link, blazor, events) {
   const toggle = page.getByRole('button', { name });
-  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
+  for (let attempt = 1; attempt <= MENU_ATTEMPTS; attempt++) {
+    if (await link.isVisible()) return;
+    if ((await toggle.getAttribute('aria-expanded')) === 'true') {
+      await link.waitFor({ state: 'visible' }); // grup sudah terbuka, tunggu animasi buka selesai
+      return;
+    }
+    const sentBefore = blazor.sent;
+    const clickedAt = Date.now();
     await toggle.click();
-    await page.waitForTimeout(500);
+    while (Date.now() - clickedAt < ACTION_WAIT * 1000) {
+      if (await link.isVisible()) return;
+      if (clickIgnored(blazor, sentBefore, clickedAt)) break;
+      await page.waitForTimeout(200);
+    }
+    if (blazor.sent === sentBefore && blazor.pending.size === 0) {
+      events.emit('counter', 'kmqr.menu_retry', 1); // klik diabaikan Blazor, aman diulang
+      continue;
+    }
+    throw new Error(`Menu "${name}" did not open within ${ACTION_WAIT}s after the click was sent to the server`);
   }
+  throw new Error(`Menu "${name}" click was not processed by Blazor after ${MENU_ATTEMPTS} attempts`);
 }
 
-async function expandMenus(page) {
-  for (const name of MENU_TOGGLES) {
-    await openMenuGroup(page, name);
-  }
-}
-
-async function openModule(page, mod) {
-  await openMenuGroup(page, mod.group);
-  await page.getByRole('link', { name: mod.name, exact: true }).click();
+async function openModule(page, mod, blazor, events) {
+  const link = page.getByRole('link', { name: mod.name, exact: true });
+  await openMenuGroup(page, mod.group, link, blazor, events);
+  await link.click();
 
   await page.waitForURL(`**${mod.path}`);
   await page.getByRole('heading', { name: mod.heading, exact: true }).waitFor({ state: 'visible' });
   await page.waitForFunction((sel) => !document.querySelector(sel), LOADING_SELECTOR);
 }
 
-/** Pilih opsi di dropdown MudBlazor berdasarkan label filter (SBU, Site, Year, Month, Type). */
+/**
+ * Pilih opsi di dropdown MudBlazor berdasarkan label filter (SBU, Site, Year, Month, Type).
+ * Dropdown ditutup oleh server setelah opsi dipilih. Selama masih terbuka, overlay-nya menutupi halaman
+ * sehingga klik filter berikutnya tertahan; jadi tunggu sampai dropdown benar-benar tertutup, bukan jeda tetap.
+ */
 async function selectFilter(page, label, option) {
   const control = page.locator('.mud-input-control').filter({ has: page.locator('label', { hasText: new RegExp(`^${label}$`) }) }).first();
   await control.click();
   await page.locator('.mud-popover-open .mud-list-item').filter({ hasText: new RegExp(`^\\s*${option}\\s*$`) }).first().click();
-  await page.waitForTimeout(500);
+  // Hanya popover berisi daftar opsi; popover lain (mis. tooltip yang sedang di-hover) tidak ikut ditunggu
+  await page.waitForFunction(() => !document.querySelector('.mud-popover-open .mud-list-item'), null, { timeout: ACTION_WAIT * 1000 })
+    .catch(() => {
+      throw new Error(`Filter "${label}" dropdown did not close within ${ACTION_WAIT}s after choosing "${option}" (server did not respond)`);
+    });
 }
 
 /** Isi filter metrics secara acak dari kombinasi yang berisi data. Urutan penting: Year mengubah daftar Site. */
@@ -443,7 +494,7 @@ async function kmqrJourney(page, vuContext, events, test) {
     await test.step('open_login_page', async () => {
       await page.goto('/'); // relatif terhadap config.target
       // "/" di-redirect Blazor ke /Auth/Login; isi form sebelum redirect selesai akan hilang
-      await page.waitForURL(/\/Auth\/Login/);
+      await waitForLoginUrl(page);
       await page.getByRole('textbox', { name: 'Username*' }).waitFor({ state: 'visible' });
       await waitForBlazorSettled(page);
     });
@@ -454,13 +505,10 @@ async function kmqrJourney(page, vuContext, events, test) {
     await test.step('login', () => login(page, user, events, vuId, blazor));
     await think(page);
 
-    step = 'expand_menu';
-    await expandMenus(page);
-
     for (const mod of pickModules(MODULE_CLICKS, profile)) {
       step = `module_${slug(mod.name)}`;
       start = Date.now();
-      await test.step(step, () => openModule(page, mod));
+      await test.step(step, () => openModule(page, mod, blazor, events));
       const ms = Date.now() - start;
       events.emit('histogram', 'kmqr.module_load', ms);
       live('step', { vu: vuId, name: 'module', module: mod.name, ms });

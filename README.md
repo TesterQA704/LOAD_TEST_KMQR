@@ -105,6 +105,11 @@ Selama test, baris `client` menampilkan RAM bebas. Kalau RAM bebas turun di bawa
 2. Buka `MODULE_CLICKS` modul acak dari 8 modul (tidak sama berturut-turut, **minimal 1 modul metrics**):
    - **Metrics** (Target Corporate, Target Site, Target Approval, Result Input, Result Review): buka halaman → pilih filter → **REFRESH** → tunggu tabel berisi data.
    - **Dashboard Reporting** (Picapa Sira, Audit Trail, Document List): hanya dibuka.
+   - Grup sidebar dibuka per modul, hanya kalau link modulnya belum terlihat. Toggle grup diproses server (round-trip),
+     jadi setelah klik script menunggu link muncul dan **tidak** mengklik toggle lagi selama klik sebelumnya masih bisa diproses:
+     2 toggle yang sampai ke server bersamaan saling membatalkan (grup tertutup lagi). Toggle hanya diulang kalau kliknya
+     terbukti tidak terkirim ke server (counter `kmqr.menu_retry`).
+   - Setelah memilih opsi filter, script menunggu dropdown ditutup server sebelum memilih filter berikutnya.
 3. Logout.
 
 Data test per environment ada di `DATA_PROFILES` di `flows.js`, dipilih otomatis dari domain `target` di `kmqr.yml`
@@ -170,6 +175,7 @@ Ringkasan muncul di terminal, JSON lengkap dan report HTML tersimpan di `results
 | `kmqr.login` | Waktu dari klik Sign In sampai menu utama tampil (percobaan yang berhasil saja), dipakai untuk threshold |
 | `browser.step.login` | Total langkah login termasuk cek isian form dan retry |
 | `kmqr.login_retry` / `kmqr.login_form_reset` | Berapa kali login diulang / isian form hilang sebelum klik |
+| `kmqr.menu_retry` | Berapa kali klik toggle grup sidebar diulang karena tidak terkirim ke server |
 | `browser.step.module_<nama>` | Waktu buka modul tertentu sampai isinya tampil |
 | `kmqr.module_load` | Gabungan waktu buka semua modul |
 | `browser.step.refresh_<modul>` | Waktu klik REFRESH sampai tabel metrics berisi data, per modul |

@@ -7,3 +7,7 @@ data/users.csv
 # Hasil test
 results/*
 !results/.gitkeep
+
+# Sertifikat self-signed replika lokal
+mock/*.pem
+mock/out.json

@@ -226,7 +226,7 @@ function build(file) {
     .map((k) => statRow(k, k.replace('browser.page.', '').replace(/\.kmqr-user-journey$/, ''))).join('');
 
   const problems = Object.entries(c)
-    .filter(([k]) => k.startsWith('errors.') || k.startsWith('kmqr.failed_step.') || ['kmqr.logout_failed', 'kmqr.login_retry', 'kmqr.login_form_reset', 'kmqr.skipped_low_ram', 'kmqr.circuit_terminated', 'vusers.skipped'].includes(k))
+    .filter(([k]) => k.startsWith('errors.') || k.startsWith('kmqr.failed_step.') || ['kmqr.logout_failed', 'kmqr.login_retry', 'kmqr.login_form_reset', 'kmqr.menu_retry', 'kmqr.skipped_low_ram', 'kmqr.circuit_terminated', 'vusers.skipped'].includes(k))
     .sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v}</td></tr>`).join('');
 

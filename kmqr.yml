@@ -84,11 +84,11 @@ config:
         - name: level-10
           duration: 180
           arrivalCount: 36
-          maxVusers: 18
+          maxVusers: 30
         - name: level-20
           duration: 180
           arrivalCount: 72
-          maxVusers: 20
+          maxVusers: 50
       ensure:
         thresholds:
           - "kmqr.login.p95": 10000
